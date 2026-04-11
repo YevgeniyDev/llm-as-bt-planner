@@ -1,8 +1,19 @@
 # LLM-as-BT Planner
 
-This repository is a compact prototype inspired by the paper _LLM-as-BT-Planner: Leveraging LLMs for Behavior Tree Generation in Robot Task Planning_.
+This repository is a compact prototype done to try to replicate the work done in the paper _LLM-as-BT-Planner: Leveraging LLMs for Behavior Tree Generation in Robot Task Planning_ to gain deeper understanding on that topic.
 
-The main idea is simple: take a natural-language instruction, turn it into a symbolic plan with an LLM, compile that plan into a reactive Behavior Tree, and execute it in a small mock robot world. The point of the project is not to be a full robotics stack. The point is to make the planning logic visible, testable, and easy to discuss.
+For the LLM model, I used Hugging Face's open-sourced model _Qwen2.5-7B-Instruct_. However, many other models can be used too. As a testing learning methods, I chose _Human-in-the-loop generation_ and _Recursive generation_. They showed the most accurate results in the paper.
+
+The main idea is simple: take a natural-language instruction, turn it into a symbolic plan with an open-source LLM, compile that plan into a reactive Behavior Tree, and execute it in a small mock robot world.
+
+Since, I have limited physical testing capabilities, due to the absence of the real robotic arm/gripper, I decided to simulate the robot world using a lightweight symbolic world-state model shared across BT condition and action nodes.
+
+The core is _src/robot_actions.py_ (line 20), where _RobotWorldState_ stores:
+
+- robot_location
+- held_object
+- object_locations
+- inserted_objects
 
 Right now the project includes:
 
@@ -63,8 +74,6 @@ Fallback(
 )
 ```
 
-That is the core difference between a procedural demo and a reactive planning prototype.
-
 ## Implemented Features
 
 ### Scheme 3: Human-in-the-loop
@@ -77,17 +86,17 @@ The system can:
 4. ask the LLM to revise the plan
 5. execute the accepted result
 
-This is useful when you want to inspect the tree before runtime or correct the plan without editing code.
+This method was the most accurate one in the paper. And it is useful when you want to inspect the tree before runtime or correct the plan without editing code.
 
 ### Scheme 4: Recursive planning
 
-The recursive mode follows the same high-level logic as the paper:
+The recursive mode follows the same high-level logic as the paper (Algorithm 1 code figure):
 
 - `MakePlan`: decide whether the task is primitive or should be decomposed
 - `MakeTree`: recursively expand subgoals
 - `PredictState`: roll the symbolic world state forward after each subproblem
 
-For multi-step tasks, this produces a recursive trace before execution.
+For multi-step tasks, this produces a recursive trace before execution. However, this method has largest resource consumption, as was also mentioned in the paper.
 
 ### Pre-execution validation
 
@@ -149,7 +158,7 @@ pip install -r requirements.txt
 
 ### 3. Create `.env`
 
-Copy `.env.example` to `.env`, then add your real token.
+Copy `.env.example` to `.env`, then add your Hugging Face token.
 
 Important detail:
 
@@ -277,7 +286,7 @@ What happens:
 
 ### 1. Human-in-the-loop correction
 
-In one Scheme 3 run, the model initially planned to insert a gear into a `chassis`. After human feedback, the plan was revised so both the navigation and insertion target changed to `box`, and the updated BT executed successfully.
+In one Scheme 3 run, the model initially planned to insert a gear into a `chassis`. After receiving feedback, the plan was revised so both the navigation and insertion target changed to `box`, and the updated BT executed successfully.
 
 The interesting part here is not just that the LLM changed the text. The important part is that the tree preview made it easy to inspect whether the revision was internally consistent before execution.
 
@@ -293,6 +302,12 @@ The BT did not pretend that was acceptable. At runtime, it failed safely when it
 
 That is a good outcome for this prototype. It shows the BT and world-state checks acting as a guardrail against unsafe symbolic planning.
 
+Command to replicate the scene:
+
+```powershell
+python -m src.main "Assemble the gearbox. And disassemble placing everything back."
+```
+
 ### 3. Recursive planning on a multi-stage task
 
 For a longer instruction involving a screwdriver, hammer, and gear, Scheme 4 decomposed the task into separate primitive subgoals, predicted state between them, and then executed the final flat plan successfully.
@@ -307,26 +322,6 @@ That gives the prototype a much closer connection to the recursive planning stor
 - The validator catches important reactive contradictions, but not every possible planning mistake.
 - Hugging Face model availability depends on router/provider support and remaining credits.
 
-## What This Project Is Not
-
-This project is not:
-
-- a ROS integration
-- a production robotics controller
-- a full reproduction of the paper's experimental setup
-- a general planner with arbitrary robot skills
-
-It is a focused prototype for showing that the semantic-planning ideas in the paper can be implemented, tested, and analyzed in code.
-
-## Suggested Demo Order
-
-If you are presenting this to someone, a clean order is:
-
-1. run the test suite
-2. show the dynamic failure demo
-3. run Scheme 3 once and correct a plan interactively
-4. run Scheme 4 on the multi-object task
-
 ## Final Note
 
-This repo is strongest when it is treated as a clear, inspectable research prototype. It shows the full path from language to symbolic planning to reactive execution, and it makes failure cases visible instead of hiding them.
+After trying to replicate the project, I gained deeper knowledge on the Behaviour Trees and how we can optimize them. Also, I thought about ways of improving the current research, because almost 1 year passed since the publishing of that paper and there are a lot of new LLM models that have the ability to further improve the system accuracy and efficiency. So, I hope that research will continue and maybe even I could help develop it further.

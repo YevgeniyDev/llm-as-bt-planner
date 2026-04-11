@@ -8,6 +8,8 @@ drift between the LLM output and the downstream executor.
 
 import json
 import os
+import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from openai import OpenAI
@@ -20,6 +22,7 @@ PLACEHOLDER_SECRETS = {
     "your_huggingface_token_here",
     "your_openai_api_key_here",
 }
+ACTION_SIGNATURE_PATTERN = re.compile(r"^\s*([A-Za-z_ ]+?)\s*(?:\((.*?)\))?\s*$")
 
 
 SYSTEM_PROMPT = """
@@ -67,6 +70,39 @@ Output:
 """.strip()
 
 
+REACTIVE_COMPILER_NOTES = """
+The downstream compiler turns your symbolic plan into a reactive behavior tree.
+
+Compilation rules:
+- Pick(object) is guarded by a holding condition.
+- MoveTo(target) is guarded by an at-location condition.
+- Place(object, target) is guarded by an object-at-target condition and may
+  recover by ensuring the robot is holding the object and standing at target.
+- Insert(object, target) is guarded by an inserted condition and may recover by
+  ensuring the robot is holding the object and standing at target.
+
+Therefore, prefer plans with clear postconditions and sensible object/target
+pairs so the compiled reactive BT behaves predictably.
+""".strip()
+
+
+RECURSIVE_SYSTEM_PROMPT = """
+You are implementing Algorithm 1 style recursive BT planning.
+
+Given a task instruction, the current predicted robot state, and the remaining
+recursion budget, decide whether to:
+- return a primitive manipulation plan using only Pick, Place, MoveTo, Insert
+- or decompose the task into smaller ordered subgoals
+
+Decision rules:
+1. Use "primitive" when the task can be expressed directly as a short symbolic plan.
+2. Use "decompose" for multi-object, multi-location, or clearly multi-stage tasks.
+3. If remaining depth is 1 or less, prefer "primitive".
+4. Return only valid JSON with the required keys.
+5. Keep subgoals concrete, ordered, and close to the original wording.
+""".strip()
+
+
 PLAN_SCHEMA = {
     "name": "robot_task_plan",
     "strict": True,
@@ -96,6 +132,52 @@ PLAN_SCHEMA = {
 }
 
 
+RECURSIVE_DECISION_SCHEMA = {
+    "name": "recursive_bt_decision",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["primitive", "decompose"],
+            },
+            "reason": {"type": "string"},
+            "plan": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["Pick", "Place", "MoveTo", "Insert"],
+                        },
+                        "object": {"type": "string"},
+                        "target": {"type": "string"},
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+            },
+            "subgoals": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["kind", "reason", "plan", "subgoals"],
+        "additionalProperties": False,
+    },
+}
+
+
+@dataclass
+class RecursiveDecision:
+    kind: str
+    reason: str
+    plan: List[Dict[str, str]]
+    subgoals: List[str]
+
+
 class LLMTaskPlanner:
     """
     Small wrapper around chat-completions compatible LLM providers.
@@ -115,7 +197,11 @@ class LLMTaskPlanner:
         self.api_key = self._resolve_api_key(api_key, self.provider)
         self.client = self._build_client()
 
-    def plan_task(self, instruction: str) -> List[Dict[str, str]]:
+    def plan_task(
+        self,
+        instruction: str,
+        state_summary: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
         """
         Convert a free-form user instruction into a validated action list.
 
@@ -128,7 +214,217 @@ class LLMTaskPlanner:
         if not cleaned_instruction:
             raise ValueError("Instruction must be a non-empty string.")
 
-        response = self._request_plan(cleaned_instruction)
+        response = self._request_completion(
+            self._build_plan_messages(cleaned_instruction, state_summary=state_summary),
+            json_schema=PLAN_SCHEMA,
+        )
+        payload = self._parse_json_response(response)
+        plan = self._canonicalize_plan(self._extract_plan(payload))
+        self._validate_plan(plan)
+        return plan
+
+    def revise_plan(
+        self,
+        instruction: str,
+        current_plan: List[Dict[str, str]],
+        human_feedback: str,
+        tree_preview: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Revise a previously generated plan using human-in-the-loop feedback.
+        """
+
+        cleaned_instruction = instruction.strip()
+        cleaned_feedback = human_feedback.strip()
+        if not cleaned_instruction:
+            raise ValueError("Instruction must be a non-empty string.")
+        if not cleaned_feedback:
+            raise ValueError("Human feedback must be a non-empty string.")
+
+        response = self._request_completion(
+            self._build_revision_messages(
+                instruction=cleaned_instruction,
+                current_plan=current_plan,
+                human_feedback=cleaned_feedback,
+                tree_preview=tree_preview,
+            ),
+            json_schema=PLAN_SCHEMA,
+        )
+        payload = self._parse_json_response(response)
+        plan = self._canonicalize_plan(self._extract_plan(payload))
+        self._validate_plan(plan)
+        return plan
+
+    def choose_recursive_expansion(
+        self,
+        instruction: str,
+        state_summary: str,
+        remaining_depth: int,
+        max_subgoals: int = 4,
+    ) -> RecursiveDecision:
+        """
+        Decide whether to decompose a task further or emit a primitive plan.
+        """
+
+        cleaned_instruction = instruction.strip()
+        if not cleaned_instruction:
+            raise ValueError("Instruction must be a non-empty string.")
+
+        response = self._request_completion(
+            self._build_recursive_messages(
+                instruction=cleaned_instruction,
+                state_summary=state_summary,
+                remaining_depth=remaining_depth,
+                max_subgoals=max_subgoals,
+            ),
+            json_schema=RECURSIVE_DECISION_SCHEMA,
+        )
+        payload = self._parse_json_response(response)
+        return self._parse_recursive_decision(payload)
+
+    def _build_plan_messages(
+        self,
+        instruction: str,
+        state_summary: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Create the standard planning prompt.
+        """
+
+        user_lines = ['Create a task plan for this instruction: "{}"'.format(instruction)]
+        if state_summary:
+            user_lines.extend(
+                [
+                    "Current predicted world state:",
+                    state_summary,
+                    "Use this predicted state to keep the plan coherent.",
+                ]
+            )
+
+        return [
+            {
+                "role": "system",
+                "content": "{}\n\n{}".format(SYSTEM_PROMPT, REACTIVE_COMPILER_NOTES),
+            },
+            {
+                "role": "user",
+                "content": "\n".join(user_lines),
+            },
+        ]
+
+    def _build_recursive_messages(
+        self,
+        instruction: str,
+        state_summary: str,
+        remaining_depth: int,
+        max_subgoals: int,
+    ) -> List[Dict[str, str]]:
+        """
+        Create the recursive decomposition prompt.
+        """
+
+        return [
+            {
+                "role": "system",
+                "content": "{}\n\n{}".format(RECURSIVE_SYSTEM_PROMPT, REACTIVE_COMPILER_NOTES),
+            },
+            {
+                "role": "user",
+                "content": "\n".join(
+                    [
+                        'Task instruction: "{}"'.format(instruction),
+                        "Current predicted world state:",
+                        state_summary,
+                        "Remaining recursion depth: {}".format(remaining_depth),
+                        "Maximum subgoals to emit: {}".format(max_subgoals),
+                        "Return JSON with keys kind, reason, plan, subgoals.",
+                    ]
+                ),
+            },
+        ]
+
+    def _build_revision_messages(
+        self,
+        instruction: str,
+        current_plan: List[Dict[str, str]],
+        human_feedback: str,
+        tree_preview: Optional[str],
+    ) -> List[Dict[str, str]]:
+        """
+        Create a plan-repair prompt for Scheme 3 human-in-the-loop revision.
+        """
+
+        user_message = [
+            'The original instruction is: "{}"'.format(instruction),
+            "The current JSON plan is:",
+            json.dumps(current_plan, indent=2),
+            "A human reviewer said the current reactive BT is not correct.",
+            "Human feedback: {}".format(human_feedback),
+        ]
+
+        if tree_preview:
+            user_message.extend(
+                [
+                    "The current reactive BT preview is:",
+                    tree_preview,
+                ]
+            )
+
+        user_message.append(
+            "Revise the plan so the compiled reactive BT better satisfies the instruction and the human feedback."
+        )
+
+        return [
+            {
+                "role": "system",
+                "content": "{}\n\n{}".format(SYSTEM_PROMPT, REACTIVE_COMPILER_NOTES),
+            },
+            {
+                "role": "user",
+                "content": "\n".join(user_message),
+            },
+        ]
+
+    def _parse_recursive_decision(self, payload: Any) -> RecursiveDecision:
+        """
+        Normalize a recursive decomposition decision into a typed helper object.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("Recursive planning response must be a JSON object.")
+
+        kind = payload.get("kind")
+        if not isinstance(kind, str) or kind not in {"primitive", "decompose"}:
+            raise ValueError("Recursive planning response is missing a valid 'kind'.")
+
+        reason = payload.get("reason", "")
+        if not isinstance(reason, str):
+            reason = ""
+
+        raw_plan = payload.get("plan", [])
+        plan = self._canonicalize_plan(raw_plan) if isinstance(raw_plan, list) else []
+        if plan:
+            self._validate_plan(plan)
+
+        raw_subgoals = payload.get("subgoals", [])
+        subgoals = []
+        if isinstance(raw_subgoals, list):
+            for subgoal in raw_subgoals:
+                if isinstance(subgoal, str) and subgoal.strip():
+                    subgoals.append(subgoal.strip())
+
+        return RecursiveDecision(
+            kind=kind,
+            reason=reason.strip(),
+            plan=plan,
+            subgoals=subgoals,
+        )
+
+    def _parse_json_response(self, response: Any) -> Union[Dict[str, Any], List[Any]]:
+        """
+        Normalize a model response into generic JSON.
+        """
+
         message = response.choices[0].message
 
         refusal = getattr(message, "refusal", None)
@@ -139,37 +435,31 @@ class LLMTaskPlanner:
         if not content:
             raise RuntimeError("The model response did not include any content.")
 
-        payload = self._parse_json_payload(content)
-        plan = self._extract_plan(payload)
-        self._validate_plan(plan)
-        return plan
+        return self._parse_json_payload(content)
 
-    def _request_plan(self, instruction: str) -> Any:
+    def _request_completion(
+        self,
+        messages: List[Dict[str, str]],
+        json_schema: Optional[Dict[str, Any]] = None,
+        require_json: bool = True,
+    ) -> Any:
         """
-        Submit the planning request to the configured model provider.
+        Submit a planning or revision request to the configured model provider.
 
         We prefer Structured Outputs for `gpt-4o-mini`-class models because the
         JSON schema adds a reliable contract between the planner and the parser.
         For older or third-party models, we fall back to prompt-only JSON output.
         """
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": 'Create a task plan for this instruction: "{}"'.format(instruction),
-            },
-        ]
-
-        if self._supports_structured_outputs():
+        if self._supports_structured_outputs() and json_schema is not None:
             return self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                response_format={"type": "json_schema", "json_schema": PLAN_SCHEMA},
+                response_format={"type": "json_schema", "json_schema": json_schema},
                 temperature=0.0,
             )
 
-        if self.provider == "openai":
+        if self.provider == "openai" and require_json:
             return self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -436,6 +726,114 @@ class LLMTaskPlanner:
         raise ValueError(
             "Unexpected plan format. Expected a list or a JSON object with 'plan' or 'steps'."
         )
+
+    def _canonicalize_plan(self, plan: List[Any]) -> List[Dict[str, str]]:
+        """
+        Normalize mildly inconsistent model outputs into the internal plan schema.
+        """
+
+        canonical_plan = []
+        for index, step in enumerate(plan, start=1):
+            if isinstance(step, str) and step.strip():
+                step = {"action": step.strip()}
+            elif not isinstance(step, dict):
+                raise ValueError("Plan step {} is not a JSON object.".format(index))
+            canonical_plan.append(self._canonicalize_step(step))
+        return canonical_plan
+
+    def _canonicalize_step(self, step: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Extract only the action fields the BT compiler understands.
+        """
+
+        raw_action_name = step.get("action")
+        if not isinstance(raw_action_name, str) or not raw_action_name.strip():
+            raise ValueError("Plan step is missing a valid 'action' field.")
+
+        parsed_action_name, parsed_arguments = self._split_action_signature(raw_action_name)
+        canonical_action_name = self._canonicalize_action_name(parsed_action_name)
+
+        canonical_step: Dict[str, str] = {"action": canonical_action_name}
+
+        if canonical_action_name == "MoveTo":
+            target_value = self._first_non_empty_string(
+                step.get("target"),
+                step.get("destination"),
+                step.get("location"),
+                step.get("object"),
+                step.get("item"),
+                parsed_arguments[0] if len(parsed_arguments) >= 1 else None,
+            )
+            if target_value is not None:
+                canonical_step["target"] = target_value
+            return canonical_step
+
+        object_value = self._first_non_empty_string(
+            step.get("object"),
+            step.get("item"),
+            parsed_arguments[0] if len(parsed_arguments) >= 1 else None,
+        )
+
+        if canonical_action_name == "Pick":
+            if object_value is not None:
+                canonical_step["object"] = object_value
+            return canonical_step
+
+        target_value = self._first_non_empty_string(
+            step.get("target"),
+            step.get("destination"),
+            step.get("location"),
+            parsed_arguments[1] if len(parsed_arguments) >= 2 else None,
+        )
+
+        if object_value is not None:
+            canonical_step["object"] = object_value
+        if target_value is not None:
+            canonical_step["target"] = target_value
+        return canonical_step
+
+    def _split_action_signature(self, raw_action_name: str) -> tuple[str, List[str]]:
+        """
+        Split action strings like `Place(gear, tray)` into a name plus arguments.
+        """
+
+        match = ACTION_SIGNATURE_PATTERN.match(raw_action_name.strip())
+        if not match:
+            return raw_action_name.strip(), []
+
+        action_name = match.group(1).strip()
+        raw_arguments = match.group(2)
+        if not raw_arguments:
+            return action_name, []
+
+        arguments = [part.strip() for part in raw_arguments.split(",") if part.strip()]
+        return action_name, arguments
+
+    def _canonicalize_action_name(self, raw_action_name: str) -> str:
+        """
+        Map equivalent action spellings onto the exact BT vocabulary.
+        """
+
+        normalized_name = raw_action_name.strip().replace("_", "").replace(" ", "").lower()
+        mapping = {
+            "pick": "Pick",
+            "place": "Place",
+            "moveto": "MoveTo",
+            "insert": "Insert",
+        }
+        if normalized_name not in mapping:
+            return raw_action_name.strip()
+        return mapping[normalized_name]
+
+    def _first_non_empty_string(self, *values: Any) -> Optional[str]:
+        """
+        Return the first candidate value that is a non-empty string.
+        """
+
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
     def _validate_plan(self, plan: List[Dict[str, str]]) -> None:
         """

@@ -1,28 +1,33 @@
 """
 Entry point for the LLM-as-BT planner prototype.
 
-Running this module demonstrates the full pipeline:
+Running this module demonstrates the upgraded pipeline:
 1. Load credentials from `.env`
 2. Ask the LLM for a symbolic task plan
-3. Convert the plan into a behavior tree
-4. Tick the tree until it succeeds or fails
+3. Compile the plan into a reactive behavior tree with conditions and fallbacks
+4. Optionally run a human-in-the-loop review round before execution
+5. Tick the tree until it succeeds or fails
 """
 
 import json
+import os
 import sys
 import time
+from typing import List, Tuple
 
 import py_trees
 from dotenv import load_dotenv
 
 from .bt_builder import build_tree_from_json
 from .llm_client import LLMTaskPlanner
+from .plan_validator import validate_reactive_plan
+from .recursive_planner import RecursiveBTPlanner, render_recursive_trace
 
 
-DEFAULT_INSTRUCTION = '''Pick up the screwdriver. Move to the panel. 
-Place the screwdriver on the panel. Pick up the hammer. Move to the table. 
-Place the hammer on the table. Pick up the gear. Move to the chassis. 
-Insert the gear into the chassis.'''
+DEFAULT_INSTRUCTION = """Pick up the screwdriver. Move to the panel.
+Place the screwdriver on the panel. Pick up the hammer. Move to the table.
+Place the hammer on the table. Pick up the gear. Move to the chassis.
+Insert the gear into the chassis."""
 
 
 def resolve_instruction() -> str:
@@ -37,10 +42,26 @@ def resolve_instruction() -> str:
     return DEFAULT_INSTRUCTION
 
 
+def resolve_planning_scheme() -> str:
+    """
+    Choose which paper-inspired planning scheme to run.
+    """
+
+    raw_value = os.getenv("PLANNING_SCHEME", "scheme3").strip().lower()
+    if raw_value in {"scheme3", "human_in_the_loop", "human"}:
+        return "scheme3"
+    if raw_value in {"scheme4", "recursive"}:
+        return "scheme4"
+
+    raise ValueError(
+        "Unsupported PLANNING_SCHEME '{}'. Use 'scheme3' or 'scheme4'.".format(raw_value)
+    )
+
+
 def execute_tree(
     tree: py_trees.trees.BehaviourTree,
     tick_period_seconds: float = 0.5,
-    max_ticks: int = 20,
+    max_ticks: int = 30,
 ) -> py_trees.common.Status:
     """
     Tick the tree until it reaches a terminal state.
@@ -71,27 +92,169 @@ def execute_tree(
     )
 
 
+def render_tree(tree: py_trees.trees.BehaviourTree) -> str:
+    """
+    Render a readable preview of the reactive BT for demos and review rounds.
+    """
+
+    return py_trees.display.unicode_tree(root=tree.root, show_status=False)
+
+
+def print_plan_validation_warnings(plan: List[dict]) -> List[str]:
+    """
+    Print pre-execution warnings for plans that may oscillate reactively.
+    """
+
+    warnings = validate_reactive_plan(plan)
+    if not warnings:
+        return []
+
+    print("\n[Validate] Reactive plan warnings:")
+    for warning in warnings:
+        print("[Validate] - {}".format(warning))
+
+    return warnings
+
+
+def should_run_human_review() -> bool:
+    """
+    Enable Scheme 3 review only when the session is interactive and not disabled.
+    """
+
+    raw_value = os.getenv("ENABLE_HUMAN_IN_THE_LOOP", "true").strip().lower()
+    return raw_value not in {"0", "false", "no"} and sys.stdin.isatty()
+
+
+def ask_human_review() -> Tuple[bool, str]:
+    """
+    Ask the operator to approve or critique the compiled BT before execution.
+    """
+
+    while True:
+        answer = input("\n[Review] Does this reactive BT look correct? [y/n]: ").strip().lower()
+        if answer in {"y", "yes"}:
+            return True, ""
+
+        if answer in {"n", "no"}:
+            feedback = input("[Review] What should the planner fix?: ").strip()
+            if feedback:
+                return False, feedback
+            return (
+                False,
+                "The human reviewer rejected the tree. Revise the plan so it better matches the instruction.",
+            )
+
+        print("[Review] Please answer with 'y' or 'n'.")
+
+
+def review_plan_with_human(
+    planner: LLMTaskPlanner,
+    instruction: str,
+    plan: List[dict],
+) -> Tuple[List[dict], py_trees.trees.BehaviourTree]:
+    """
+    Run Scheme 3 human-in-the-loop review and allow iterative plan repair.
+    """
+
+    current_plan = plan
+    max_rounds = max(1, int(os.getenv("MAX_REVIEW_ROUNDS", "3")))
+
+    for round_index in range(1, max_rounds + 1):
+        tree = build_tree_from_json(current_plan)
+        tree_preview = render_tree(tree)
+
+        print("\n[Review] Round {}/{}".format(round_index, max_rounds))
+        print_plan_validation_warnings(current_plan)
+        print("[BT] Reactive tree preview:")
+        print(tree_preview)
+
+        approved, feedback = ask_human_review()
+        if approved:
+            return current_plan, tree
+
+        print("\n[Review] Revising plan from human feedback...")
+        current_plan = planner.revise_plan(
+            instruction=instruction,
+            current_plan=current_plan,
+            human_feedback=feedback,
+            tree_preview=tree_preview,
+        )
+        print("\n[LLM] Revised JSON plan:")
+        print(json.dumps(current_plan, indent=2))
+
+    raise RuntimeError(
+        "The plan was rejected in all {} human review rounds.".format(max_rounds)
+    )
+
+
 def main() -> None:
     """Run the complete instruction-to-behavior-tree pipeline."""
 
     load_dotenv()
 
     instruction = resolve_instruction()
+    planning_scheme = resolve_planning_scheme()
     print("[Main] Instruction: {}".format(instruction))
+    print("[Main] Planning scheme: {}".format(planning_scheme))
 
     planner = LLMTaskPlanner()
     print("[Main] Using provider: {}".format(planner.provider))
     print("[Main] Using model: {}".format(planner.model))
 
-    plan = planner.plan_task(instruction)
+    if planning_scheme == "scheme4":
+        recursive_planner = RecursiveBTPlanner(
+            planner=planner,
+            max_depth=max(1, int(os.getenv("MAX_RECURSION_DEPTH", "3"))),
+            max_subgoals_per_level=max(1, int(os.getenv("MAX_SUBGOALS_PER_LEVEL", "4"))),
+        )
+        recursive_trace = recursive_planner.make_tree(instruction)
+        plan = recursive_trace.plan
 
-    print("\n[LLM] Generated JSON plan:")
-    print(json.dumps(plan, indent=2))
+        print("\n[Recursive] Algorithm 1 planning trace:")
+        print(render_recursive_trace(recursive_trace))
 
-    tree = build_tree_from_json(plan)
+        print("\n[LLM] Recursive flat JSON plan:")
+        print(json.dumps(plan, indent=2))
+        print_plan_validation_warnings(plan)
+
+        if os.getenv("ENABLE_HUMAN_IN_THE_LOOP", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }:
+            print("\n[Review] Scheme 4 selected, so Scheme 3 human review is skipped for this run.")
+
+        tree = build_tree_from_json(plan)
+        print("\n[BT] Reactive tree preview:")
+        print(render_tree(tree))
+    else:
+        plan = planner.plan_task(instruction)
+
+        print("\n[LLM] Generated JSON plan:")
+        print(json.dumps(plan, indent=2))
+
+        if should_run_human_review():
+            plan, tree = review_plan_with_human(planner, instruction, plan)
+        else:
+            print_plan_validation_warnings(plan)
+            if os.getenv("ENABLE_HUMAN_IN_THE_LOOP", "true").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }:
+                print("\n[Review] Human-in-the-loop review skipped because stdin is not interactive.")
+
+            tree = build_tree_from_json(plan)
+            print("\n[BT] Reactive tree preview:")
+            print(render_tree(tree))
+
     final_status = execute_tree(tree)
 
     print("\n[Main] Final behavior tree status: {}".format(final_status.name))
+
+    world_state = getattr(tree, "world_state", None)
+    if world_state is not None:
+        print("[Main] Final world state: {}".format(world_state.summary()))
 
 
 if __name__ == "__main__":

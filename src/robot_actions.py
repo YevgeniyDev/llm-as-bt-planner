@@ -28,6 +28,7 @@ class RobotWorldState:
 
     robot_location: str = "home"
     held_object: Optional[str] = None
+    equipped_tool: str = "default_gripper"
     object_locations: Dict[str, str] = field(default_factory=dict)
     inserted_objects: Dict[str, str] = field(default_factory=dict)
 
@@ -78,6 +79,9 @@ class RobotWorldState:
     def is_inserted(self, object_name: str, target: str) -> bool:
         return self.inserted_objects.get(object_name.strip()) == target.strip()
 
+    def is_tool_equipped(self, tool_name: str) -> bool:
+        return self.equipped_tool == tool_name.strip()
+
     def summary(self) -> str:
         """
         Produce a compact final-state summary for demos.
@@ -98,10 +102,12 @@ class RobotWorldState:
             )
             or "none"
         )
-        return (
-            "robot_at={}, holding={}, placed={}, inserted={}".format(
-                self.robot_location, held, placed_items, inserted_items
-            )
+        return "robot_at={}, holding={}, tool={}, placed={}, inserted={}".format(
+            self.robot_location,
+            held,
+            self.equipped_tool,
+            placed_items,
+            inserted_items,
         )
 
     def clone(self) -> "RobotWorldState":
@@ -112,6 +118,7 @@ class RobotWorldState:
         return RobotWorldState(
             robot_location=self.robot_location,
             held_object=self.held_object,
+            equipped_tool=self.equipped_tool,
             object_locations=dict(self.object_locations),
             inserted_objects=dict(self.inserted_objects),
         )
@@ -151,7 +158,12 @@ class RobotWorldState:
 
         action_key = action_name.strip().replace("_", "").replace(" ", "").lower()
         object_name = step.get("object") or step.get("item")
-        target = step.get("target") or step.get("destination") or step.get("location")
+        target = (
+            step.get("target")
+            or step.get("destination")
+            or step.get("location")
+            or step.get("tool")
+        )
 
         cleaned_object_name = object_name.strip() if isinstance(object_name, str) else None
         cleaned_target = target.strip() if isinstance(target, str) else None
@@ -167,6 +179,10 @@ class RobotWorldState:
 
         if action_key == "moveto" and cleaned_target:
             self.robot_location = cleaned_target
+            return
+
+        if action_key == "changetool" and cleaned_target:
+            self.equipped_tool = cleaned_target
             return
 
         if action_key == "place" and cleaned_object_name and cleaned_target:
@@ -290,6 +306,22 @@ class InsertedAt(WorldStateCondition):
 
     def evaluate(self) -> bool:
         return self.world_state.is_inserted(self.object_name, self.target)
+
+
+class ToolEquipped(WorldStateCondition):
+    """Check whether the requested tool is already mounted."""
+
+    def __init__(self, tool_name: str, world_state: RobotWorldState) -> None:
+        self.tool_name = tool_name.strip()
+        self.world_state = world_state
+        super().__init__(
+            name="Equipped({})".format(self.tool_name),
+            success_message="Already equipped with {}.".format(self.tool_name),
+            failure_message="{} is not equipped yet.".format(self.tool_name),
+        )
+
+    def evaluate(self) -> bool:
+        return self.world_state.is_tool_equipped(self.tool_name)
 
 
 class MockRobotAction(py_trees.behaviour.Behaviour):
@@ -429,6 +461,22 @@ class MoveTo(MockRobotAction):
         self.world_state.robot_location = self.target
 
 
+class ChangeTool(MockRobotAction):
+    """Simulated tool change action."""
+
+    def __init__(self, tool_name: str, world_state: RobotWorldState) -> None:
+        self.tool_name = tool_name.strip()
+        super().__init__(
+            name="ChangeTool({})".format(self.tool_name),
+            start_message="[Robot] Switching to the {}.".format(self.tool_name),
+            success_message="[Robot] Successfully equipped the {}.".format(self.tool_name),
+            world_state=world_state,
+        )
+
+    def apply_effects(self) -> None:
+        self.world_state.equipped_tool = self.tool_name
+
+
 class Insert(MockRobotAction):
     """Simulated insertion or assembly action."""
 
@@ -437,15 +485,16 @@ class Insert(MockRobotAction):
         object_name: str,
         target: str,
         world_state: RobotWorldState,
-        alignment_hint: Optional[str] = None,
+        required_tool: Optional[str] = None,
     ) -> None:
         self.object_name = object_name.strip()
         self.target = target.strip()
+        self.required_tool = required_tool.strip() if isinstance(required_tool, str) else None
         world_state.register_object(self.object_name)
 
         hint_suffix = ""
-        if alignment_hint:
-            hint_suffix = " using {}".format(alignment_hint.strip())
+        if self.required_tool:
+            hint_suffix = " using {}".format(self.required_tool)
 
         super().__init__(
             name="Insert({}, {})".format(self.object_name, self.target),
@@ -467,6 +516,11 @@ class Insert(MockRobotAction):
         if not self.world_state.is_at(self.target):
             return "[Robot] Cannot insert the {} because the robot is not at the {}.".format(
                 self.object_name, self.target
+            )
+
+        if self.required_tool and not self.world_state.is_tool_equipped(self.required_tool):
+            return "[Robot] Cannot insert the {} because {} is not equipped.".format(
+                self.object_name, self.required_tool
             )
 
         return None

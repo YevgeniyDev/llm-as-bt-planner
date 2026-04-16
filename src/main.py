@@ -13,13 +13,14 @@ import json
 import os
 import sys
 import time
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import py_trees
 from dotenv import load_dotenv
 
 from .bt_builder import build_tree_from_json
 from .llm_client import LLMTaskPlanner
+from .multi_robot_planner import build_multi_robot_tree_from_json, resolve_robot_profiles
 from .plan_validator import validate_reactive_plan
 from .recursive_planner import RecursiveBTPlanner, render_recursive_trace
 
@@ -30,14 +31,29 @@ Place the hammer on the table. Pick up the gear. Move to the chassis.
 Insert the gear into the chassis."""
 
 
+TreeBuilder = Callable[[List[dict]], py_trees.trees.BehaviourTree]
+
+
 def resolve_instruction() -> str:
     """
-    Use a CLI-provided instruction when available, otherwise fall back to the
-    example requested in the project brief.
+    Use a CLI-provided instruction when available. Otherwise, prompt in an
+    interactive terminal and fall back to the default example on empty input.
     """
 
     if len(sys.argv) > 1:
         return " ".join(sys.argv[1:]).strip()
+
+    if sys.stdin.isatty():
+        print("[Main] Enter a task instruction and press Enter.")
+        print("[Main] Leave it empty to use the default example:")
+        print(DEFAULT_INSTRUCTION)
+        try:
+            typed_instruction = input("\n[Main] Instruction: ").strip()
+        except EOFError:
+            return DEFAULT_INSTRUCTION
+
+        if typed_instruction:
+            return typed_instruction
 
     return DEFAULT_INSTRUCTION
 
@@ -55,6 +71,22 @@ def resolve_planning_scheme() -> str:
 
     raise ValueError(
         "Unsupported PLANNING_SCHEME '{}'. Use 'scheme3' or 'scheme4'.".format(raw_value)
+    )
+
+
+def should_use_multi_robot() -> bool:
+    raw_value = os.getenv("ENABLE_MULTI_ROBOT", "false").strip().lower()
+    return raw_value in {"1", "true", "yes", "on"}
+
+
+def resolve_tree_builder() -> Tuple[TreeBuilder, Optional[list]]:
+    if not should_use_multi_robot():
+        return build_tree_from_json, None
+
+    robot_profiles = resolve_robot_profiles(os.getenv("MULTI_ROBOT_ROBOTS"))
+    return (
+        lambda plan: build_multi_robot_tree_from_json(plan, robot_profiles=robot_profiles),
+        robot_profiles,
     )
 
 
@@ -151,6 +183,7 @@ def review_plan_with_human(
     planner: LLMTaskPlanner,
     instruction: str,
     plan: List[dict],
+    tree_builder: TreeBuilder = build_tree_from_json,
 ) -> Tuple[List[dict], py_trees.trees.BehaviourTree]:
     """
     Run Scheme 3 human-in-the-loop review and allow iterative plan repair.
@@ -160,7 +193,7 @@ def review_plan_with_human(
     max_rounds = max(1, int(os.getenv("MAX_REVIEW_ROUNDS", "3")))
 
     for round_index in range(1, max_rounds + 1):
-        tree = build_tree_from_json(current_plan)
+        tree = tree_builder(current_plan)
         tree_preview = render_tree(tree)
 
         print("\n[Review] Round {}/{}".format(round_index, max_rounds))
@@ -194,8 +227,17 @@ def main() -> None:
 
     instruction = resolve_instruction()
     planning_scheme = resolve_planning_scheme()
+    tree_builder, robot_profiles = resolve_tree_builder()
     print("[Main] Instruction: {}".format(instruction))
     print("[Main] Planning scheme: {}".format(planning_scheme))
+
+    if robot_profiles is not None:
+        robot_summary = ", ".join(
+            "{}<{}>".format(profile.name, "/".join(profile.capabilities))
+            for profile in robot_profiles
+        )
+        print("[Main] Multi-robot mode: enabled")
+        print("[Main] Robot team: {}".format(robot_summary))
 
     planner = LLMTaskPlanner()
     print("[Main] Using provider: {}".format(planner.provider))
@@ -224,7 +266,7 @@ def main() -> None:
         }:
             print("\n[Review] Scheme 4 selected, so Scheme 3 human review is skipped for this run.")
 
-        tree = build_tree_from_json(plan)
+        tree = tree_builder(plan)
         print("\n[BT] Reactive tree preview:")
         print(render_tree(tree))
     else:
@@ -234,7 +276,12 @@ def main() -> None:
         print(json.dumps(plan, indent=2))
 
         if should_run_human_review():
-            plan, tree = review_plan_with_human(planner, instruction, plan)
+            plan, tree = review_plan_with_human(
+                planner,
+                instruction,
+                plan,
+                tree_builder=tree_builder,
+            )
         else:
             print_plan_validation_warnings(plan)
             if os.getenv("ENABLE_HUMAN_IN_THE_LOOP", "true").strip().lower() not in {
@@ -244,7 +291,7 @@ def main() -> None:
             }:
                 print("\n[Review] Human-in-the-loop review skipped because stdin is not interactive.")
 
-            tree = build_tree_from_json(plan)
+            tree = tree_builder(plan)
             print("\n[BT] Reactive tree preview:")
             print(render_tree(tree))
 

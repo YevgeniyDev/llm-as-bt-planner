@@ -9,6 +9,7 @@ import py_trees
 
 from .robot_actions import (
     AtLocation,
+    ChangeTool,
     Holding,
     Insert,
     InsertedAt,
@@ -17,6 +18,7 @@ from .robot_actions import (
     Pick,
     Place,
     RobotWorldState,
+    ToolEquipped,
 )
 
 
@@ -108,6 +110,16 @@ def _create_reactive_subtree(
         )
         return _fallback("Step {} MoveTo {}".format(step_number, target), selector_children)
 
+    if action_key == "changetool":
+        tool_name = _get_required_field(step, step_number, "tool", "target", "object")
+        return _fallback(
+            "Step {} ChangeTool {}".format(step_number, tool_name),
+            [
+                ToolEquipped(tool_name, world_state),
+                ChangeTool(tool_name, world_state),
+            ],
+        )
+
     if action_key == "place":
         object_name = _get_required_field(step, step_number, "object", "item")
         target = _get_required_field(step, step_number, "target", "destination", "location")
@@ -141,31 +153,53 @@ def _create_reactive_subtree(
     if action_key == "insert":
         object_name = _get_required_field(step, step_number, "object", "item")
         target = _get_required_field(step, step_number, "target", "destination", "location")
+        required_tool = _get_optional_field(step, "tool")
+        recovery_children: List[py_trees.behaviour.Behaviour] = [
+            _fallback(
+                "EnsureHolding({})".format(object_name),
+                [
+                    Holding(object_name, world_state),
+                    Pick(object_name, world_state),
+                ],
+            ),
+        ]
+        if required_tool:
+            recovery_children.append(
+                _fallback(
+                    "EnsureTool({})".format(required_tool),
+                    [
+                        ToolEquipped(required_tool, world_state),
+                        ChangeTool(required_tool, world_state),
+                    ],
+                )
+            )
+        recovery_children.extend(
+            [
+                _fallback(
+                    "EnsureAt({})".format(target),
+                    [
+                        AtLocation(target, world_state),
+                        MoveTo(target, world_state),
+                    ],
+                ),
+                Insert(object_name, target, world_state, required_tool=required_tool),
+            ]
+        )
         return _fallback(
             "Step {} Insert {}".format(step_number, object_name),
             [
                 InsertedAt(object_name, target, world_state),
                 _sequence(
                     "RecoverThenInsert({})".format(object_name),
-                    [
-                        _fallback(
-                            "EnsureHolding({})".format(object_name),
-                            [
-                                Holding(object_name, world_state),
-                                Pick(object_name, world_state),
-                            ],
-                        ),
-                        _fallback(
-                            "EnsureAt({})".format(target),
-                            [
-                                AtLocation(target, world_state),
-                                MoveTo(target, world_state),
-                            ],
-                        ),
-                        Insert(object_name, target, world_state),
-                    ],
+                    recovery_children,
                 ),
             ],
+        )
+
+    if action_key == "handoff":
+        raise ValueError(
+            "Unsupported action '{}' at plan step {}. Use multi-robot mode for Handoff."
+            .format(raw_action_name, step_number)
         )
 
     raise ValueError(

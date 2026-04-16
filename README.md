@@ -1,171 +1,140 @@
 # LLM-as-BT Planner
 
-This repository is a compact prototype done to try to replicate the work done in the paper _LLM-as-BT-Planner: Leveraging LLMs for Behavior Tree Generation in Robot Task Planning_ to gain deeper understanding on that topic.
+LLM-as-BT Planner turns natural-language task instructions into executable behavior trees.  
+The update also adds an MRBTP-inspired multi-robot layer and a visual gridworld simulator for testing team behavior.
 
-For the LLM model, I used Hugging Face's open-sourced model _Qwen2.5-7B-Instruct_. However, many other models can be used too. As a testing learning methods, I chose _Human-in-the-loop generation_ and _Recursive generation_. They showed the most accurate results in the paper.
+## What This Repository Does
 
-The main idea is simple: take a natural-language instruction, turn it into a symbolic plan with an open-source LLM, compile that plan into a reactive Behavior Tree, and execute it in a small mock robot world.
+It combines two ideas:
 
-Since, I have limited physical testing capabilities, due to the absence of the real robotic arm/gripper, I decided to simulate the robot world using a lightweight symbolic world-state model shared across BT condition and action nodes.
+- **LLM-as-BT-Planner**: use an LLM to convert instructions into a small symbolic plan
+- **MRBTP**: turn that plan into coordinated multi-robot behavior with explicit assignment, handoff, and reactive execution
 
-The core is _src/robot_actions.py_ (line 20), where _RobotWorldState_ stores:
+The result is:
 
-- robot_location
-- held_object
-- object_locations
-- inserted_objects
+1. a user types an instruction
+2. the LLM outputs a short symbolic action list
+3. the compiler builds a reactive behavior tree
+4. the multi-robot layer splits the work across robots
+5. the gridworld simulator visualizes and tests the result
 
-Right now the project includes:
+## Action Vocabulary
 
-- reactive BT compilation with condition and fallback nodes
-- Scheme 3 from the paper - "human-in-the-loop revision"
-- Scheme 4 from the paper - "recursive planning with predicted-state rollouts"
-- pre-execution validation for contradictory plans
-- reproducible tests and demos
-
-## What the Project Actually Does
-
-The LLM does not generate raw tree control flow directly. It generates a simple symbolic action plan using a small fixed vocabulary:
+The planner uses a small fixed set of actions:
 
 - `Pick`
 - `MoveTo`
 - `Place`
 - `Insert`
+- `ChangeTool`
+- `Handoff`
 
-That symbolic plan is then compiled into a reactive `py_trees` Behavior Tree.
+This is deliberate: the LLM chooses **what** should happen, while deterministic code decides **how** to compile and execute it.
 
-For example, a symbolic step like:
+## How LLM-as-BT-Planner and MRBTP Are Joined
 
-```text
-Pick(gear)
+### In Plain Words
+
+The two systems are not fused into one monolithic model.
+
+- The **LLM-as-BT-Planner** part is the semantic front end. It reads the instruction and produces a compact symbolic plan.
+- The **MRBTP-inspired** part is the execution backbone. It takes that symbolic plan, splits it into goal-carrying chunks, assigns them to robots, and builds a coordinated team behavior tree.
+
+So the LLM does not directly write a full multi-robot tree.  
+Instead:
+
+- the LLM says: `Pick`, `MoveTo`, `Place`, `Handoff`, `Insert`, ...
+- the MRBTP layer decides which robot should do which chunk
+- the BT compiler turns those chunks into reactive trees with conditions and recovery logic
+
+### Technically
+
+The main join points are:
+
+```python
+from src.llm_client import LLMTaskPlanner
+from src.bt_builder import build_tree_from_json
+from src.multi_robot_planner import build_multi_robot_tree_from_json, resolve_robot_profiles
+
+planner = LLMTaskPlanner()
+plan = planner.plan_task("Pick the gear and insert it into the chassis.")
+
+# Single-robot reactive BT
+tree = build_tree_from_json(plan)
+
+# Multi-robot reactive BT
+profiles = resolve_robot_profiles()
+team_tree = build_multi_robot_tree_from_json(plan, robot_profiles=profiles)
 ```
 
-becomes a reactive subtree like:
+For the testing simulator, the join is similar but scenario-oriented:
 
-```text
-Fallback(
-  Holding(gear),
-  Pick(gear)
+```python
+from src.gridworld_env import build_env_from_typed_scenario
+from src.llm_client import LLMTaskPlanner
+
+planner = LLMTaskPlanner()
+env = build_env_from_typed_scenario(
+    scenario_text="All robots collect circles and place them in different corners.",
+    num_robots=3,
+    num_circles=3,
+    layout_name="open_room",
+    planner=planner,
 )
 ```
 
-That separation matters. It keeps the LLM output simple, while the control logic stays deterministic and inspectable.
+In the multi-robot path, the repo adds:
 
-## Why the Reactive BT Matters
+- plan segmentation into goal chunks
+- phase grouping for parallel execution
+- robot capability filtering
+- explicit `Handoff` support
+- tool-aware `Insert` support
+- intention-aware backup suppression
 
-This is not just a script that runs actions in order.
+## Main Features
 
-The root node is a memoryless `Sequence`, so the tree checks earlier conditions again on every tick. That gives the system three useful behaviors:
+- natural language -> symbolic plan -> reactive BT
+- single-robot and multi-robot execution paths
+- human-in-the-loop revision (`scheme3`)
+- recursive planning (`scheme4`)
+- explicit handoff and tool-change support
+- LLM-driven visual gridworld simulator
+- transport and assembly-style gridworld tasks with gears, shafts, fixtures, and tool-aware inserts
+- offline demo scenarios
+- unit tests for planner, compiler, multi-robot behavior, and gridworld execution
 
-1. If a precondition is already satisfied, the action is skipped.
-2. If the world changes during execution, the tree can recover.
-3. If the symbolic plan is contradictory, the system exposes the contradiction instead of silently hiding it.
+## Quick Start
 
-For `Place(gear, table)`, the compiler produces logic like this:
+If you only want to clone the repo and run the visual simulator:
 
-```text
-Fallback(
-  ObjectAt(gear, table),
-  Sequence(
-    Fallback(Holding(gear), Pick(gear)),
-    Fallback(At(table), MoveTo(table)),
-    Place(gear, table)
-  )
-)
+### 1. Clone
+
+```powershell
+git clone https://github.com/YevgeniyDev/llm-as-bt-planner.git
+cd llm-as-bt-planner
 ```
 
-## Implemented Features
-
-### Scheme 3: Human-in-the-loop
-
-The system can:
-
-1. ask the LLM for a symbolic plan
-2. render the reactive BT preview
-3. pause for human feedback
-4. ask the LLM to revise the plan
-5. execute the accepted result
-
-This method was the most accurate one in the paper. And it is useful when you want to inspect the tree before runtime or correct the plan without editing code.
-
-### Scheme 4: Recursive planning
-
-The recursive mode follows the same high-level logic as the paper (Algorithm 1 code figure):
-
-- `MakePlan`: decide whether the task is primitive or should be decomposed
-- `MakeTree`: recursively expand subgoals
-- `PredictState`: roll the symbolic world state forward after each subproblem
-
-For multi-step tasks, this produces a recursive trace before execution. However, this method has largest resource consumption, as was also mentioned in the paper.
-
-### Pre-execution validation
-
-The project also checks for a specific class of reactive plan mistakes before execution starts.
-
-Example:
-
-```json
-[
-  { "action": "Pick", "object": "gear" },
-  { "action": "MoveTo", "target": "chassis" },
-  { "action": "Insert", "object": "gear", "target": "chassis2" }
-]
-```
-
-This looks small, but in a reactive memoryless BT it can cause oscillation:
-
-- one part of the tree keeps enforcing `At(chassis)`
-- another part keeps enforcing `At(chassis2)`
-
-The validator warns about that before execution.
-
-## Project Structure
-
-```text
-llm-as-bt-planner/
-|-- src/
-|   |-- __init__.py
-|   |-- bt_builder.py
-|   |-- demo_scenarios.py
-|   |-- llm_client.py
-|   |-- main.py
-|   |-- plan_validator.py
-|   |-- recursive_planner.py
-|   `-- robot_actions.py
-|-- tests/
-|   |-- test_llm_client.py
-|   |-- test_plan_validator.py
-|   `-- test_reactive_bt.py
-|-- .env.example
-|-- requirements.txt
-`-- README.md
-```
-
-## Setup
-
-### 1. Create a virtual environment
+### 2. Create and activate a virtual environment
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 2. Install dependencies
+### 3. Install dependencies
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 3. Create `.env`
+### 4. Create `.env`
 
-Copy `.env.example` to `.env`, then add your Hugging Face token.
+```powershell
+Copy-Item .env.example .env
+```
 
-Important detail:
-
-- `.env.example` is only a template
-- the program actually reads `.env`
-- shell environment variables also count
-- `load_dotenv()` does not override values already set in your shell
+Then put real credentials in `.env`.
 
 Minimal Hugging Face setup:
 
@@ -173,11 +142,9 @@ Minimal Hugging Face setup:
 LLM_PROVIDER=huggingface
 HF_TOKEN=your_real_huggingface_token
 HUGGINGFACE_MODEL=Qwen/Qwen2.5-7B-Instruct
-PLANNING_SCHEME=scheme3
-ENABLE_HUMAN_IN_THE_LOOP=true
 ```
 
-Optional OpenAI setup:
+Minimal OpenAI setup:
 
 ```env
 LLM_PROVIDER=openai
@@ -185,143 +152,194 @@ OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-## Configuration
+### 5. Launch the visual simulator
 
-| Variable                   | Meaning                                  |
-| -------------------------- | ---------------------------------------- |
-| `LLM_PROVIDER`             | `huggingface` or `openai`                |
-| `HF_TOKEN`                 | Hugging Face token for router access     |
-| `HUGGINGFACE_MODEL`        | model id used for Hugging Face inference |
-| `OPENAI_API_KEY`           | OpenAI API key                           |
-| `OPENAI_MODEL`             | OpenAI model id                          |
-| `PLANNING_SCHEME`          | `scheme3` or `scheme4`                   |
-| `ENABLE_HUMAN_IN_THE_LOOP` | enables the interactive review step      |
-| `MAX_REVIEW_ROUNDS`        | max revision rounds in Scheme 3          |
-| `MAX_RECURSION_DEPTH`      | recursion depth for Scheme 4             |
-| `MAX_SUBGOALS_PER_LEVEL`   | subgoal cap per recursive layer          |
+```powershell
+python -m src.demo_scenarios typed_gridworld
+```
 
-## How to Run
+That opens the Tkinter testing window.
 
-### Default run
+## Simulator Usage
+
+The visual simulator is the easiest way to test the project.
+
+You can:
+
+- choose a preset or `Custom`
+- type your own instruction
+- choose robot count
+- choose object count
+- choose a layout
+- run and replay the scenario
+- inspect actions, object state, plan, and BT
+
+The simulator supports both:
+
+- transport-style objects such as circles, squares, and triangles
+- assembly-style objects such as gears, shafts, pins, and plates, plus fixed locations such as `chassis`, `bearing_block`, `panel_slot`, `tool_rack`, and `precision_station`
+
+### Default behavior
+
+- If you select `Custom` and leave the placeholder unchanged, the simulator runs the default scenario.
+- The `Summary` panel is hidden by default.
+
+### Presets
+
+- `Custom` - write your own instruction; if you leave the placeholder unchanged, the default scenario runs
+- `Distributed Corners` - each robot takes a circle and delivers it to a different corner
+- `Two Move One Waits` - two robots work on delivery while a third stays idle at the center
+- `Stationary Receiver` - two robots bring circles one by one to a waiting receiver robot
+- `Three Robot Relay` - one circle is passed across three robots before its final placement
+- `Parallel Rooms` - robots distribute circles across separate rooms with parallel work
+- `Wall Sweep` - eight robots place eight circles along the room walls in a larger map
+- `Precision Insert` - one robot changes to a precision tool and inserts a gear into the chassis
+- `Relay Insert` - one robot hands off a shaft and another robot changes tools before inserting it
+- `Three Robot Assembly` - two feeder robots fetch parts in parallel while one assembler prepares and inserts both parts
+- `Four Robot Assembly` - two feeder robots and two assembler robots cooperate on a dual-part assembly with parallel final inserts
+
+### Layouts
+
+- `open_room` - one open area with no internal walls; best for simple coordination tests
+- `split_room` - two main areas connected by doorways; useful for routing and partial separation
+- `four_rooms` - a four-room map with connecting openings; good for multi-region delivery and relay tasks
+- `handoff_hall` - rooms linked by a central corridor; designed for handoff and receiver-style scenarios
+
+## Common Commands
+
+### Open the visual simulator
+
+```powershell
+python -m src.demo_scenarios typed_gridworld
+```
+
+### Open the simulator with a predefined scenario
+
+```powershell
+python -m src.demo_scenarios typed_gridworld --scenario-text "All robots collect circles and place them along the walls." --num-robots 8 --num-circles 8 --layout four_rooms
+```
+
+### Run the simulator in text-only mode (doesn't open simulator window, instead shows it in terminal)
+
+```powershell
+python -m src.demo_scenarios typed_gridworld --text-only
+```
+
+### Run the main planner pipeline
 
 ```powershell
 python -m src.main
 ```
 
-### Run Scheme 3 explicitly
+Use this when you want to test the normal text-to-BT flow outside the gridworld simulator. The command prompts for an instruction in the terminal, falls back to the default example if you leave it empty, sends the task to the configured LLM, validates the generated symbolic plan, builds the behavior tree, and executes it with the project runtime. This path requires a valid provider setup in `.env`.
 
-```powershell
-$env:PLANNING_SCHEME='scheme3'
-$env:ENABLE_HUMAN_IN_THE_LOOP='true'
-python -m src.main "Assemble the gearbox."
-```
-
-If you reject the first plan, keep the feedback inside the current action vocabulary. A good correction is:
-
-```text
-Replace chassis with box everywhere.
-```
-
-A request like:
-
-```text
-Change the tool first.
-```
-
-is outside the current symbolic skill set, because the prototype does not implement a `ChangeTool` primitive.
-
-### Run Scheme 4 explicitly
-
-```powershell
-$env:PLANNING_SCHEME='scheme4'
-$env:ENABLE_HUMAN_IN_THE_LOOP='false'
-python -m src.main "Pick up the screwdriver. Move to the panel. Place the screwdriver on the panel. Pick up the hammer. Move to the table. Place the hammer on the table. Pick up the gear. Move to the chassis. Insert the gear into the chassis."
-```
-
-You should see:
-
-- a recursive planning trace
-- a flat symbolic plan
-- a reactive BT preview
-- tick-by-tick execution ending in `SUCCESS`
-
-## Testing
-
-Run the full test suite with:
+### Run the full test suite
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-The tests cover:
+Use this after setup or after making code changes. It runs the automated test modules for the planner, LLM client, gridworld environment, GUI helpers, validation logic, and reactive BT behavior, then prints a verbose pass/fail result for each test. This is the fastest way to confirm the repo is installed correctly and that recent changes did not break existing behavior.
 
-- reactive BT structure
-- skip-if-already-satisfied behavior
-- dynamic failure recovery
-- Scheme 3 revision flow
-- recursive-output canonicalization
-- contradictory-target validation
+### Run offline demos
 
-## Demo Scenarios
-
-### Dynamic failure recovery
-
-This is the clearest demo of why the tree is reactive.
-
-Run:
+These do **not** require an LLM call.
 
 ```powershell
 python -m src.demo_scenarios dynamic_failure
+python -m src.demo_scenarios multi_robot_parallel
+python -m src.demo_scenarios heterogeneous_handoff
 ```
 
-What happens:
+These are small deterministic examples for debugging the symbolic BT layer without depending on external APIs or the visual simulator:
 
-- the robot picks up the gear
-- it starts moving toward the table
-- a fault is injected and the gear is dropped
-- the next tick re-checks the conditions
-- the tree goes back to `Pick(gear)` and recovers
+- `dynamic_failure` simulates a single-robot recovery case where an object is dropped mid-task and the reactive BT must recover.
+- `multi_robot_parallel` shows two robots executing different goal segments in parallel under the multi-robot planner.
+- `heterogeneous_handoff` shows capability-aware cooperation, where one robot hands off an object and another changes tools before finishing the task.
 
-## Real Examples From This Prototype
+## Configuration
 
-### 1. Human-in-the-loop correction
+Important `.env` variables:
 
-In one Scheme 3 run, the model initially planned to insert a gear into a `chassis`. After receiving feedback, the plan was revised so both the navigation and insertion target changed to `box`, and the updated BT executed successfully.
+| Variable                   | Purpose                                            |
+| -------------------------- | -------------------------------------------------- |
+| `LLM_PROVIDER`             | `huggingface` or `openai`                          |
+| `HF_TOKEN`                 | Hugging Face token                                 |
+| `HUGGINGFACE_MODEL`        | Hugging Face model id                              |
+| `OPENAI_API_KEY`           | OpenAI key                                         |
+| `OPENAI_MODEL`             | OpenAI model id                                    |
+| `PLANNING_SCHEME`          | `scheme3` or `scheme4`                             |
+| `ENABLE_HUMAN_IN_THE_LOOP` | enables manual review for `scheme3`                |
+| `MAX_REVIEW_ROUNDS`        | max revision rounds for `scheme3`                  |
+| `MAX_RECURSION_DEPTH`      | recursion depth for `scheme4`                      |
+| `MAX_SUBGOALS_PER_LEVEL`   | recursive branching cap                            |
+| `ENABLE_MULTI_ROBOT`       | enables the multi-robot path in `src.main`         |
+| `MULTI_ROBOT_ROBOTS`       | optional JSON robot-team config for `src.main`     |
+| `GRIDWORLD_REPAIR_ROUNDS`  | LLM repair retries for invalid simulator scenarios |
 
-The interesting part here is not just that the LLM changed the text. The important part is that the tree preview made it easy to inspect whether the revision was internally consistent before execution.
+Notes:
 
-### 2. Behavior Trees as a safety net
+- The visual simulator uses its own robot specs produced by the LLM scenario planner.
+- `ENABLE_MULTI_ROBOT` matters for `src.main`, not for the gridworld tester.
 
-In another test, the model produced a plan that effectively tried to re-pick objects after inserting them during an assembly/disassembly-style sequence.
+## What To Test First
 
-The BT did not pretend that was acceptable. At runtime, it failed safely when it reached:
+Recommended order:
 
-```text
-[Robot] Cannot pick the gear because it is already inserted.
-```
+1. `python -m src.demo_scenarios typed_gridworld`
+2. `python -m unittest discover -s tests -v`
+3. `python -m src.demo_scenarios multi_robot_parallel`
+4. `python -m src.main`
 
-That is a good outcome for this prototype. It shows the BT and world-state checks acting as a guardrail against unsafe symbolic planning.
+This checks:
 
-Command to replicate the scene:
+- the GUI opens
+- your API credentials work
+- the simulator runs
+- the unit tests pass
+- the main instruction-to-BT pipeline works
+
+## Troubleshooting
+
+### The visual window does not open
+
+- On Windows, Tkinter is usually included with standard Python.
+- On Linux, you may need `python3-tk`.
+- If you are on a headless machine, use:
 
 ```powershell
-python -m src.main "Assemble the gearbox. And disassemble placing everything back."
+python -m src.demo_scenarios typed_gridworld --text-only
 ```
 
-### 3. Recursive planning on a multi-stage task
+### The simulator falls back to text mode immediately
 
-For a longer instruction involving a screwdriver, hammer, and gear, Scheme 4 decomposed the task into separate primitive subgoals, predicted state between them, and then executed the final flat plan successfully.
+- Check `.env`
+- Make sure your token is real, not a placeholder
+- Re-run after updating credentials
 
-That gives the prototype a much closer connection to the recursive planning story described in the paper.
+### The LLM produces an invalid gridworld scenario
 
-## Limitations
+The simulator already tries repair rounds via `GRIDWORLD_REPAIR_ROUNDS`, but badly underspecified instructions can still fail.  
+When that happens, make the instruction more explicit about:
 
-- The symbolic action space is intentionally small.
-- The environment is a mock world, not a full robotics stack.
-- Scheme 3 works best when the requested revision can still be expressed with `Pick`, `MoveTo`, `Place`, and `Insert`.
-- The validator catches important reactive contradictions, but not every possible planning mistake.
-- Hugging Face model availability depends on router/provider support and remaining credits.
+- which robots move
+- who waits
+- where handoffs happen
+- final target locations
 
-## Final Note
+## Key Files
 
-After trying to replicate the project, I gained deeper knowledge on the Behaviour Trees and how we can optimize them. Also, I thought about ways of improving the current research, because almost 1 year passed since the publishing of that paper and there are a lot of new LLM models that have the ability to further improve the system accuracy and efficiency. So, I hope that research will continue and maybe even I could help develop it further.
+- `src/llm_client.py` - LLM planning and repair prompts
+- `src/bt_builder.py` - single-robot BT compiler
+- `src/multi_robot_planner.py` - MRBTP-style team BT compiler
+- `src/gridworld_env.py` - gridworld execution environment
+- `src/gridworld_app.py` - visual simulator UI
+- `src/gridworld_presets.py` - simulator presets
+- `src/demo_scenarios.py` - demos and simulator launcher
+
+## Limits
+
+- The action vocabulary is intentionally small.
+- The world is symbolic, not a real robot middleware stack.
+- The multi-robot layer is strongest on transport, handoff, and insertion-style tasks.
+- Heterogeneous collaboration depends on explicit symbolic actions such as `Handoff` and `ChangeTool`.

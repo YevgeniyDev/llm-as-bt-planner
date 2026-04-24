@@ -92,6 +92,119 @@ In the multi-robot path, the repo adds:
 - tool-aware `Insert` support
 - intention-aware backup suppression
 
+### How Backward Planning Works
+
+The symbolic backward planner in `src/multi_robot_planner.py` bridges an
+assigned goal and the final executable reactive subtree.
+
+A concrete example is the easiest way to see what that means.
+
+Suppose one assigned segment says robot `robot1` should place a gear on a
+table. The terminal goal literal for that segment would be:
+
+```text
+ObjectAt(gear, table)
+```
+
+`BackwardGoalPlanner` starts from that goal and creates a root planning
+condition:
+
+```text
+{ObjectAt(gear, table)}
+```
+
+Then `one_step_expand()` checks the candidate symbolic actions available to the
+assigned robot. If `Place(robot1, gear, table)` is relevant, the planner
+regresses the goal through that action and derives the prerequisite condition
+set:
+
+```text
+{Holding(robot1, gear), At(robot1, table)}
+```
+
+The planner then expands those prerequisites in the same way:
+
+- `Pick(robot1, gear)` helps achieve `Holding(robot1, gear)`
+- `MoveTo(robot1, table)` helps achieve `At(robot1, table)`
+
+Eventually the search may bottom out at a condition such as:
+
+```text
+{HandEmpty(robot1)}
+```
+
+If the predicted start state already contains `HandEmpty(robot1)`, the planner
+stops expanding that branch. The result is not just a flat action list. It is a
+small regression tree that says:
+
+- goal: `ObjectAt(gear, table)`
+- achieve it with `Place`
+- before that, require `Holding(robot1, gear)` and `At(robot1, table)`
+- achieve `Holding(...)` with `Pick`
+- achieve `At(...)` with `MoveTo`
+- stop when the remaining condition is already true in the predicted state
+
+Finally, `compile_planning_condition()` turns that regression tree into a
+reactive `py_trees` subtree with selectors, sequences, condition checks, and
+action nodes. In other words, this block bridges an assigned symbolic goal and
+an executable reactive subtree.
+
+### How Robot Assignment Works
+
+Robot assignment is decided by deterministic Python code, not by the LLM at
+execution time. The main decision point is `allocate_phase_segments()` in
+`src/multi_robot_planner.py`.
+
+The assignment flow is:
+
+1. `segment_plan()` breaks the flat symbolic plan into goal-oriented segments.
+2. `group_segments_into_phases()` decides which segments can run in parallel.
+3. `allocate_phase_segments()` assigns each segment to a robot.
+
+The assignment logic uses the following rules:
+
+- If a plan step already specifies a `robot` field, that explicit choice wins.
+  This is handled by `_assign_explicit_segment()`.
+- If no robot is specified, the planner filters the team through
+  `robot_can_execute_segment()`.
+
+`robot_can_execute_segment()` checks whether a robot can realistically own that
+segment, including:
+
+- whether it has the required capability: `Pick`, `MoveTo`, `Place`, `Insert`,
+  `ChangeTool`, or `Handoff`
+- whether the required tool is available
+- whether it already holds the object
+- whether some other robot already holds the object
+- whether it can reach the required location
+- for handoff segments, whether it can act as the giver rather than the
+  recipient
+
+After filtering, selection works like this:
+
+- For a single segment, the planner usually picks the first capable robot by
+  priority.
+- For `Place` and `Insert` segments, the planner may also create backup
+  assignments through `_segment_supports_backups()`.
+- For multiple segments in the same phase, the planner balances work with a
+  small workload counter. Among capable robots, it prefers the robot with the
+  lowest current workload and then the lower priority value.
+
+Handoffs are handled separately:
+
+- `_build_handoff_phase_subtree()` creates a dedicated handoff phase.
+- The receiver is fixed by the `recipient` field.
+- `_select_handoff_giver()` chooses the giver by preferring an explicitly
+  assigned giver, otherwise the robot already holding the object, and otherwise
+  the first capable robot by priority.
+
+So the practical summary is:
+
+- the LLM may suggest a robot by emitting a `robot` field in the symbolic plan
+- the actual ownership decision is still enforced by deterministic code
+- the assignment is based on explicit tags, capabilities, tool access,
+  predicted world state, object ownership, workload balancing, and priority
+
 ## Main Features
 
 - natural language -> symbolic plan -> reactive BT
